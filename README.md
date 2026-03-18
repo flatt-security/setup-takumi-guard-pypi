@@ -9,6 +9,11 @@
   A GitHub Action that routes installs through a security proxy — no secrets, no config files, two lines of YAML.
 </p>
 
+<p align="center">
+  <a href="https://github.com/flatt-security/setup-takumi-guard-pypi/actions/workflows/test.yml"><img src="https://github.com/flatt-security/setup-takumi-guard-pypi/actions/workflows/test.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/flatt-security/setup-takumi-guard-pypi" alt="License" /></a>
+</p>
+
 ---
 
 > **Not using CI?** For local setup on your laptop, see the [email registration & token management appendix](#appendix-email-registration--token-management) below.
@@ -17,7 +22,6 @@
 
 - [What is Takumi Guard?](#what-is-takumi-guard)
 - [Quickstart (3 steps)](#quickstart)
-- [Verify it works](#verify-it-works)
 - [Setup modes](#setup-modes)
 - [Migrating existing projects](#migrating-existing-projects)
 - [Inputs](#inputs)
@@ -76,28 +80,6 @@ jobs:
 ```
 
 > **Where do I get a Bot ID?** Create one at [Shisho Cloud byGMO](https://cloud.shisho.dev) -- or skip this entirely. Blocking works without it. The Bot ID is a public reference key, not a secret.
-
----
-
-## Verify it works
-
-Confirm blocking is active by trying to install a known-blocked test package.
-
-**From your terminal** (no account or setup needed):
-
-```bash
-pip install --index-url https://pypi.flatt.tech/simple/ panda-guard-test-malicious
-```
-
-**Or as a CI step** in your workflow:
-
-```yaml
-      - name: Verify Takumi Guard is active
-        run: |
-          pip install panda-guard-test-malicious && exit 1 || echo "Blocked as expected"
-```
-
-> **Expected result:** The install fails with a block message. If it does, the guard is working.
 
 ---
 
@@ -174,7 +156,7 @@ Unlike npm, pip does not use lockfiles that reference a specific registry URL by
 
 ```bash
 # Add the Takumi Guard source
-poetry source add takumi-guard https://pypi.flatt.tech/simple/
+poetry source add --priority=primary takumi-guard https://pypi.flatt.tech/simple/
 
 # Regenerate lockfile
 poetry lock --no-update
@@ -250,13 +232,15 @@ curl -X POST https://pypi.flatt.tech/api/v1/tokens \
   -d '{"email": "you@example.com", "language": "ja"}'
 ```
 
-### Configure pip
+### Configure pip / uv
+
+Set `PIP_INDEX_URL` with your token. This applies to both pip and uv:
 
 ```bash
-pip install --index-url https://token:tg_anon_xxx...@pypi.flatt.tech/simple/ <package>
+export PIP_INDEX_URL=https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
 ```
 
-Or configure globally in `~/.config/pip/pip.conf` (Linux/macOS) or `%APPDATA%\pip\pip.ini` (Windows):
+To make this permanent, add the line to your shell profile or configure in `~/.config/pip/pip.conf` (Linux/macOS) or `%APPDATA%\pip\pip.ini` (Windows):
 
 ```ini
 [global]
@@ -264,19 +248,6 @@ index-url = https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
 ```
 
 After this, `pip install` routes through Takumi Guard with your identity attached. If a package you downloaded is later found to be malicious, you will receive a breach notification email.
-
-### Configure uv
-
-```bash
-uv pip install --index-url https://token:tg_anon_xxx...@pypi.flatt.tech/simple/ <package>
-```
-
-Or set in `uv.toml`:
-
-```toml
-[pip]
-index-url = "https://token:tg_anon_xxx...@pypi.flatt.tech/simple/"
-```
 
 ### Check token status
 

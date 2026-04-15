@@ -24,7 +24,7 @@ inputs:
     required: false
     default: '1800'
   set-index-url:
-    description: 'Set PIP_INDEX_URL environment variable. Set to false if you manage the index URL yourself.'
+    description: 'Set PIP_INDEX_URL and UV_INDEX_URL environment variables. Set to false if you manage the index URL yourself.'
     required: false
     default: 'true'
 
@@ -43,8 +43,10 @@ runs:
         SET_INDEX_URL: ${{ inputs.set-index-url }}
       run: |
         if [ "$SET_INDEX_URL" != "false" ]; then
-          # Set PIP_INDEX_URL for pip, uv, and any PEP 503 compliant client
+          # Set PIP_INDEX_URL for pip and any PEP 503 compliant client
           echo "PIP_INDEX_URL=${REGISTRY_URL}/simple/" >> "$GITHUB_ENV"
+          # Set UV_INDEX_URL for uv project commands (add/sync/lock)
+          echo "UV_INDEX_URL=${REGISTRY_URL}/simple/" >> "$GITHUB_ENV"
           echo "::notice::PyPI index set to ${REGISTRY_URL}/simple/"
         fi
 
@@ -123,6 +125,7 @@ runs:
 
         echo "::add-mask::${AUTHENTICATED_URL}"
         echo "PIP_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
+        echo "UV_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
 
         # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
         EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \

@@ -130,7 +130,7 @@ steps:
 
 ### Auth-only (advanced)
 
-> **For custom setups.** You manage `PIP_INDEX_URL` yourself. The action only handles authentication.
+> **For custom setups.** You manage `PIP_INDEX_URL` / `UV_INDEX_URL` yourself. The action only handles authentication.
 
 ```yaml
 - uses: flatt-security/setup-takumi-guard-pypi@v1
@@ -140,8 +140,8 @@ steps:
 ```
 
 **Key details:**
-- Useful for projects that need full control over pip configuration.
-- Requires `PIP_INDEX_URL=https://pypi.flatt.tech/simple/` set in your environment or `pip.conf`.
+- Useful for projects that need full control over pip/uv configuration.
+- Requires `PIP_INDEX_URL=https://pypi.flatt.tech/simple/` (and `UV_INDEX_URL` for uv) set in your environment or config files.
 - If authentication fails, **the action exits with an error** -- there is no fallback.
 
 ---
@@ -150,7 +150,7 @@ steps:
 
 Unlike npm, pip does not use lockfiles that reference a specific registry URL by default. Most projects can adopt Takumi Guard without any lockfile changes.
 
-**For pip / uv:** No migration needed. The action sets `PIP_INDEX_URL` and all installs automatically route through the proxy.
+**For pip / uv:** No migration needed. The action sets `PIP_INDEX_URL` (for pip) and `UV_INDEX_URL` (for uv) so all installs automatically route through the proxy.
 
 **For poetry** (with `poetry.lock`):
 
@@ -173,7 +173,7 @@ git commit -m "Route installs through Takumi Guard"
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `bot-id` | No | -- | Bot ID from Shisho Cloud byGMO. Omit for blocking-only mode. |
-| `set-index-url` | No | `true` | Set `PIP_INDEX_URL` environment variable. Set to `false` if you manage it yourself. |
+| `set-index-url` | No | `true` | Set `PIP_INDEX_URL` and `UV_INDEX_URL` environment variables. Set to `false` if you manage them yourself. |
 | `registry-url` | No | `https://pypi.flatt.tech` | Registry endpoint. |
 | `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
@@ -205,7 +205,7 @@ git commit -m "Route installs through Takumi Guard"
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Tokens and authenticated URLs are automatically masked in workflow logs.
-- **Environment-scoped** -- The action sets `PIP_INDEX_URL` for the current job only. Your global pip config is untouched.
+- **Environment-scoped** -- The action sets `PIP_INDEX_URL` and `UV_INDEX_URL` for the current job only. Your global pip/uv config is untouched.
 - **Basic auth in URL** -- pip uses `https://token:ACCESS_TOKEN@host/simple/` format. The full URL is masked in logs.
 
 ---
@@ -234,20 +234,23 @@ curl -X POST https://pypi.flatt.tech/api/v1/tokens \
 
 ### Configure pip / uv
 
-Set `PIP_INDEX_URL` with your token. This applies to both pip and uv:
+Set the index URL with your token:
 
 ```bash
+# For pip (and uv pip commands)
 export PIP_INDEX_URL=https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
+# For uv project commands (add/sync/lock)
+export UV_INDEX_URL=https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
 ```
 
-To make this permanent, add the line to your shell profile or configure in `~/.config/pip/pip.conf` (Linux/macOS) or `%APPDATA%\pip\pip.ini` (Windows):
+To make this permanent, add the lines to your shell profile or configure pip in `~/.config/pip/pip.conf` (Linux/macOS) or `%APPDATA%\pip\pip.ini` (Windows):
 
 ```ini
 [global]
 index-url = https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
 ```
 
-After this, `pip install` routes through Takumi Guard with your identity attached. If a package you downloaded is later found to be malicious, you will receive a breach notification email.
+After this, `pip install` and `uv` commands route through Takumi Guard with your identity attached. If a package you downloaded is later found to be malicious, you will receive a breach notification email.
 
 ### Check token status
 

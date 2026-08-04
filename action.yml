@@ -15,6 +15,10 @@ inputs:
     description: 'STS service URL'
     required: false
     default: 'https://sts.cloud.shisho.dev'
+  audience:
+    description: 'Audience for the OIDC token request. Defaults to the STS URL. Override when your Bot trust condition expects a different value.'
+    required: false
+    default: ''
   registry-url:
     description: 'PyPI registry URL'
     required: false
@@ -56,6 +60,7 @@ runs:
       env:
         BOT_ID: ${{ inputs.bot-id }}
         STS_URL: ${{ inputs.sts-url }}
+        AUDIENCE_INPUT: ${{ inputs.audience }}
         REGISTRY_URL: ${{ inputs.registry-url }}
         EXPIRES_IN: ${{ inputs.expires-in }}
         SET_INDEX_URL: ${{ inputs.set-index-url }}
@@ -78,9 +83,22 @@ runs:
           fi
         fi
 
+        # Resolve the OIDC audience: an explicit input wins; otherwise default
+        # to the STS URL. The audience names the verifier of the token, which
+        # is the STS regardless of registry; it is also the console's default
+        # audience for trust conditions. Normalized without a trailing slash
+        # because STS matches it as an exact string.
+        STS_URL_NORMALIZED=$(echo "$STS_URL" | sed 's|/$||')
+        if [ -n "$AUDIENCE_INPUT" ]; then
+          OIDC_AUDIENCE="$AUDIENCE_INPUT"
+        else
+          OIDC_AUDIENCE="$STS_URL_NORMALIZED"
+        fi
+
         OIDC_TOKEN=$(curl -sS -f \
           -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi.flatt.tech" \
+          -G --data-urlencode "audience=${OIDC_AUDIENCE}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}" \
           | jq -r '.value' 2>/dev/null) || true
 
         if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then

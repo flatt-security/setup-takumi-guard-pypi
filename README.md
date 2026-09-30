@@ -144,7 +144,7 @@ steps:
 - Run the action after `actions/checkout`, so it can read the project's configuration.
 - pip and poetry take the token from the `.netrc` entry the action writes for `pypi.flatt.tech`. Nothing else to set up.
 - uv takes the token for:
-  - `UV_INDEX_URL`, `UV_DEFAULT_INDEX` or `PIP_INDEX_URL` that you set in the job's `env:` before the action and that point to `https://pypi.flatt.tech/simple/`. The action adds the token to them.
+  - `UV_INDEX_URL` or `UV_DEFAULT_INDEX` that you set in the job's `env:` before the action and that point to `https://pypi.flatt.tech/simple/`. The action adds the token to them.
   - Every named index (`[[tool.uv.index]]` in `pyproject.toml`, `[[index]]` in `uv.toml`) in the checkout that points to Takumi Guard, under its own name (uv 0.4.26 or later).
   - An index the action cannot see, such as one created after it runs, when you pass its name in `uv-index-name` (`takumi-guard` by default).
 
@@ -259,9 +259,9 @@ curl -X POST https://pypi.flatt.tech/api/v1/tokens \
 Set the index URL with your token:
 
 ```bash
-# For pip (and uv pip commands)
+# For pip
 export PIP_INDEX_URL=https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
-# For uv project commands (add/sync/lock)
+# For uv (uv pip and project commands such as add/sync/lock)
 export UV_INDEX_URL=https://token:tg_anon_xxx...@pypi.flatt.tech/simple/
 ```
 

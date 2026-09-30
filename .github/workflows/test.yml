@@ -63,6 +63,426 @@ jobs:
           [ "$PIP_INDEX_URL" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::PIP_INDEX_URL does not carry the token"; exit 1; }
           [ "$UV_INDEX_URL" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::UV_INDEX_URL does not carry the token"; exit 1; }
 
+  netrc:
+    name: the token is written to a job .netrc (set-index-url ${{ matrix.set-index-url }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        set-index-url: ['true', 'false']
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      # An entry another step added for a different host, and earlier entries
+      # for the registry host in the multi-line form and on a shared line.
+      - name: Existing .netrc
+        run: |
+          printf 'machine golang.flatt.tech login _ password other-token\nmachine pypi.flatt.tech\n  login token\n  password stale-token\nmachine a.test login x password 1 machine pypi.flatt.tech login token password stale-token-2\n' > "$HOME/.netrc"
+          cp "$HOME/.netrc" "$RUNNER_TEMP/home.netrc.before"
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-index-url: ${{ matrix.set-index-url }}
+
+      - name: One entry for the registry host, the other hosts kept, owner-only, ~/.netrc untouched
+        env:
+          SET_INDEX_URL: ${{ matrix.set-index-url }}
+        run: |
+          [ "${NETRC:-}" = "$RUNNER_TEMP/.netrc" ] || { echo "::error::NETRC is '${NETRC:-}', not the job .netrc"; exit 1; }
+          sed 's/password .*/password ***/' "$NETRC"
+          grep -qx 'machine golang.flatt.tech login _ password other-token' "$NETRC" || { echo "::error::the entry for another host was lost"; exit 1; }
+          grep -qx 'machine a.test login x password 1' "$NETRC" || { echo "::error::an entry sharing a line with the registry host was lost"; exit 1; }
+          [ "$(grep -c 'pypi.flatt.tech' "$NETRC")" = 1 ] || { echo "::error::the registry host has more than one entry"; exit 1; }
+          grep -q 'stale-token' "$NETRC" && { echo "::error::an earlier entry for the registry host was kept"; exit 1; }
+          grep -qx 'machine pypi.flatt.tech login token password standin-guard-token' "$NETRC" || { echo "::error::the token is not in the job .netrc"; exit 1; }
+          [ "$(stat -c %a "$NETRC")" = 600 ] || { echo "::error::the job .netrc is readable by others"; exit 1; }
+          cmp -s "$HOME/.netrc" "$RUNNER_TEMP/home.netrc.before" || { echo "::error::~/.netrc was modified"; exit 1; }
+          [ "${UV_INDEX_TAKUMI_GUARD_USERNAME:-}" = token ] && [ "${UV_INDEX_TAKUMI_GUARD_PASSWORD:-}" = standin-guard-token ] || { echo "::error::the credentials for the takumi-guard uv index were not set"; exit 1; }
+          if [ "$SET_INDEX_URL" = false ]; then
+            [ -z "${PIP_INDEX_URL:-}${UV_INDEX_URL:-}${UV_DEFAULT_INDEX:-}" ] || { echo "::error::the index was set although set-index-url is false"; exit 1; }
+          else
+            for v in PIP_INDEX_URL UV_INDEX_URL; do
+              [ "${!v:-}" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::$v does not carry the token"; exit 1; }
+            done
+          fi
+
+  netrc-anonymous:
+    name: without bot-id no .netrc is written
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./
+
+      - name: NETRC is not set and ~/.netrc does not exist
+        run: |
+          [ -z "${NETRC:-}" ] || { echo "::error::NETRC was set without bot-id"; exit 1; }
+          [ ! -e "$HOME/.netrc" ] || { echo "::error::~/.netrc was written without bot-id"; exit 1; }
+
+  uv-index-name:
+    name: uv-index-name ${{ matrix.name }} sets ${{ matrix.variable }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: my-guard
+            variable: UV_INDEX_MY_GUARD_PASSWORD
+          - name: My.Guard_2
+            variable: UV_INDEX_MY_GUARD_2_PASSWORD
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-index-url: 'false'
+          uv-index-name: ${{ matrix.name }}
+
+      - name: The variable uv reads for that name holds the token
+        env:
+          VARIABLE: ${{ matrix.variable }}
+        run: |
+          [ "${!VARIABLE:-}" = standin-guard-token ] || { echo "::error::$VARIABLE does not hold the token"; exit 1; }
+
+  netrc-port:
+    name: a port in registry-url is left out of the .netrc host
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          registry-url: https://pypi.flatt.tech:443
+
+      # .netrc matches on the host name alone, so an entry naming host:port
+      # would never be used.
+      - name: The entry names the host without the port
+        run: |
+          grep -qx 'machine pypi.flatt.tech login token password standin-guard-token' "$NETRC" || { echo "::error::the .netrc entry does not name the bare host"; sed 's/password .*/password ***/' "$NETRC"; exit 1; }
+          [ "$PIP_INDEX_URL" = "https://token:standin-guard-token@pypi.flatt.tech:443/simple/" ] || { echo "::error::the index URL lost the port"; exit 1; }
+
+  auth-only-index-variables:
+    name: in auth-only mode the token is added to index variables that point at the registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # What a caller sets for its own index; only the last one points elsewhere.
+    env:
+      PIP_INDEX_URL: http://pypi.flatt.tech/simple/
+      UV_INDEX_URL: https://user:old-token@pypi.flatt.tech/simple/
+      UV_DEFAULT_INDEX: https://pypi.org/simple/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-index-url: 'false'
+
+      - name: Each variable carries the token once over https, the other index is untouched
+        run: |
+          [ "$PIP_INDEX_URL" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::PIP_INDEX_URL is not the registry URL with the token"; exit 1; }
+          [ "$UV_INDEX_URL" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::UV_INDEX_URL is not the registry URL with the token"; exit 1; }
+          [ "$UV_DEFAULT_INDEX" = "https://pypi.org/simple/" ] || { echo "::error::an index pointing elsewhere was changed"; exit 1; }
+
+  checkout-scan:
+    name: uv indexes in the checkout get the token and other indexes are reported
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      # Indexes on the registry: a named uv index, an unnamed one and one in
+      # uv.toml. Indexes elsewhere: explicit ones, which serve chosen packages
+      # only, and ones that serve every package, one with credentials in its
+      # URL. Names shared with an index elsewhere: the default uv-index-name,
+      # and "shared", whose other index is explicit. Also a file inside .venv,
+      # and a directory and a file the runner cannot read.
+      - name: Project configuration
+        run: |
+          mkdir -p fixture/sub fixture/other fixture/.venv fixture/pgdata fixture/locked
+          printf '[project]\nname="p"\n\n[[tool.uv.index]]\nname = "my-guard"  # Takumi Guard\nurl = "https://pypi.flatt.tech/simple/"\ndefault = true\n\n[[tool.uv.index]]\nurl = "https://pypi.flatt.tech/simple/"\n\n[[tool.uv.index]]\nname = "pytorch-cpu"\nurl = "https://download.pytorch.org/whl/cpu"\nexplicit = true\n\n[[tool.uv.index]]\nname = "corp"\nurl = "https://alice:s3cret@corp.example/simple/"\n' > fixture/pyproject.toml
+          printf '[[tool.poetry.source]]\nname = "internal"\nurl = "https://corp.example/simple/"\npriority = "explicit"\n\n[[tool.poetry.source]]\nname = "pub"\nurl = "https://pypi.org/simple/"\npriority = "primary"\n\n[[tool.uv.index]]\nname = "takumi-guard"\nurl = "https://corp.example/simple/"\n\n[[tool.uv.index]]\nname = "shared"\nurl = "https://pypi.flatt.tech/simple/"\n' > fixture/sub/pyproject.toml
+          printf '[[tool.uv.index]]\nname = "Shared"\nurl = "https://elsewhere.example/simple/"\nexplicit = true\n' > fixture/other/pyproject.toml
+          printf '[[index]]\nname = "Guard.2"\nurl = "https://pypi.flatt.tech/simple/"\n' > fixture/uv.toml
+          printf '[[tool.uv.index]]\nname = "in-venv"\nurl = "https://pypi.flatt.tech/simple/"\n' > fixture/.venv/pyproject.toml
+          printf -- '-i https://pypi.org/simple/\n--index-url=https://pypi.flatt.tech/simple/\n--extra-index-url https://bob:pw@extra.example/simple/\nsix==1.16.0\n' > fixture/requirements-dev.txt
+          printf '[[tool.uv.index]]\nname = "locked"\nurl = "https://pypi.flatt.tech/simple/"\n' > fixture/locked/pyproject.toml
+          chmod 000 fixture/pgdata fixture/locked/pyproject.toml
+
+      # No later step sees what a composite action printed, so the Authenticate
+      # script is taken out of action.yml and run to read its warnings.
+      - name: Named credentials and warnings
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+          BOT_ID: standin-bot
+          STS_URL: http://127.0.0.1:18080
+          REGISTRY_URL: https://pypi.flatt.tech
+          EXPIRES_IN: '1800'
+          SET_INDEX_URL: 'true'
+          UV_INDEX_NAME: takumi-guard
+          PIP_EXTRA_INDEX_URL: https://a.example/simple/ https://pypi.flatt.tech/simple/
+        run: |
+          python3 - <<'EOF'
+          lines = open('action.yml').read().split('\n')
+          start = next(i for i, l in enumerate(lines) if l.strip() == '- name: Authenticate')
+          run = next(i for i in range(start, len(lines)) if lines[i].strip() == 'run: |')
+          indent = len(lines[run]) - len(lines[run].lstrip())
+          body = []
+          for l in lines[run + 1:]:
+              if l.strip() and len(l) - len(l.lstrip()) <= indent:
+                  break
+              body.append(l[indent + 2:])
+          open('authenticate.sh', 'w').write('\n'.join(body) + '\n')
+          EOF
+          status=0
+          GITHUB_WORKSPACE="$PWD/fixture" GITHUB_ENV="$RUNNER_TEMP/env" GITHUB_OUTPUT=/dev/null bash --noprofile --norc -e -o pipefail authenticate.sh > out.txt 2>&1 || status=$?
+          grep '::warning::' out.txt || true
+          [ "$status" = 0 ] || { echo "::error::Authenticate exited ${status}"; tail -5 out.txt; exit 1; }
+          grep -q '^NETRC=' "$RUNNER_TEMP/env" || { echo "::error::Authenticate stopped before writing the .netrc"; exit 1; }
+          for name in MY_GUARD GUARD_2; do
+            grep -qx "UV_INDEX_${name}_PASSWORD=standin-guard-token" "$RUNNER_TEMP/env" || { echo "::error::the $name index did not get the token"; exit 1; }
+          done
+          for name in TAKUMI_GUARD SHARED IN_VENV; do
+            grep -q "UV_INDEX_${name}_" "$RUNNER_TEMP/env" && { echo "::error::the $name index got the token"; exit 1; }
+          done
+          while IFS= read -r w; do
+            grep -qxF "::warning::$w" out.txt || { echo "::error::missing warning: $w"; exit 1; }
+          done <<'EOF'
+          uv-index-name 'takumi-guard' names a uv index that does not point to Takumi Guard, so it does not get the token.
+          pyproject.toml: uv index 'corp' (https://corp.example/simple/) does not go through Takumi Guard.
+          sub/pyproject.toml: poetry index 'pub' (https://pypi.org/simple/) does not go through Takumi Guard.
+          sub/pyproject.toml: uv index 'takumi-guard' (https://corp.example/simple/) does not go through Takumi Guard.
+          sub/pyproject.toml: uv index 'shared' points to Takumi Guard, but another index with the same name points elsewhere, so it does not get the token.
+          requirements-dev.txt: --index-url (https://pypi.org/simple/) does not go through Takumi Guard.
+          requirements-dev.txt: --extra-index-url (https://extra.example/simple/) does not go through Takumi Guard.
+          PIP_EXTRA_INDEX_URL (https://a.example/simple/) does not go through Takumi Guard.
+          EOF
+          [ "$(grep -c '^::warning::' out.txt)" = 8 ] || { echo "::error::an explicit index or an index on the registry was reported"; exit 1; }
+          if grep -q -e s3cret -e 'bob:pw' out.txt; then echo "::error::credentials in an index URL were printed"; exit 1; fi
+
+  netrc-underscore:
+    name: without ~/.netrc the entries of ~/_netrc are kept
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - run: printf 'machine golang.flatt.tech login _ password other-token\n' > "$HOME/_netrc"
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+
+      - name: The job .netrc holds the token and the entries of ~/_netrc
+        run: |
+          grep -qx 'machine golang.flatt.tech login _ password other-token' "$NETRC" || { echo "::error::the entries of ~/_netrc were lost"; exit 1; }
+          grep -q 'standin-guard-token' "$NETRC" || { echo "::error::the token is not in the job .netrc"; exit 1; }
+          if grep -q 'standin-guard-token' "$HOME/_netrc"; then echo "::error::~/_netrc was modified"; exit 1; fi
+
+  uv-own-default-index:
+    name: a uv project locked against its own default index still syncs with --locked
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Locked before the action runs, against the index the project names.
+      - name: Fixture
+        run: |
+          python -m pip install -q uv
+          mkdir -p project && cd project
+          printf '[project]\nname="p"\nversion="0"\nrequires-python=">=3.9"\ndependencies=["six==1.16.0"]\n\n[[tool.uv.index]]\nname="pypi"\nurl="https://pypi.org/simple/"\ndefault=true\n' > pyproject.toml
+          UV_NO_CACHE=1 uv lock
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+
+      # Overriding the project's default index would make the lockfile stale.
+      - name: uv sync --locked
+        working-directory: project
+        run: UV_NO_CACHE=1 uv sync --locked
+
+  netrc-location:
+    name: the entries of the file an existing NETRC names are kept
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - run: |
+          printf 'machine golang.flatt.tech login _ password other-token\n' > "$RUNNER_TEMP/custom.netrc"
+          echo "NETRC=${RUNNER_TEMP}/custom.netrc" >> "$GITHUB_ENV"
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+
+      - name: The job .netrc holds the token and the entries of the earlier file
+        run: |
+          [ "$NETRC" = "$RUNNER_TEMP/.netrc" ] || { echo "::error::NETRC is '$NETRC', not the job .netrc"; exit 1; }
+          grep -qx 'machine golang.flatt.tech login _ password other-token' "$NETRC" || { echo "::error::the entries of the earlier file were lost"; exit 1; }
+          grep -q 'standin-guard-token' "$NETRC" || { echo "::error::the token is not in the job .netrc"; exit 1; }
+          grep -q 'standin-guard-token' "$RUNNER_TEMP/custom.netrc" && { echo "::error::the earlier file was modified"; exit 1; }
+          [ ! -e "$HOME/.netrc" ] || { echo "::error::~/.netrc was written"; exit 1; }
+
+  # The proxy rejects the stand-in token with 401 and answers an install without
+  # credentials with 200, so a 401 shows the client sent the token.
+  netrc-clients:
+    name: ${{ matrix.client }} sends the token
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - client: poetry (set-index-url true)
+            set-index-url: 'true'
+          - client: pip with pip.conf (set-index-url false)
+            set-index-url: 'false'
+          - client: uv with a named index (set-index-url false)
+            set-index-url: 'false'
+          - client: uv with an index named by the project (set-index-url false)
+            set-index-url: 'false'
+          - client: uv pip with UV_INDEX_URL set by the caller (set-index-url false)
+            set-index-url: 'false'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Installed before the action so that fetching the tools themselves
+      # does not go through the proxy with the stand-in token.
+      - name: Fixture
+        env:
+          CLIENT: ${{ matrix.client }}
+        run: |
+          python -m pip install -q uv poetry
+          mkdir -p project && cd project
+          case "$CLIENT" in
+            poetry*) printf '[project]\nname="p"\nversion="0"\nrequires-python=">=3.9"\ndependencies=["six==1.16.0"]\n\n[[tool.poetry.source]]\nname="takumi-guard"\nurl="https://pypi.flatt.tech/simple/"\npriority="primary"\n' > pyproject.toml ;;
+            pip*) mkdir -p "$HOME/.config/pip"; printf '[global]\nindex-url = https://pypi.flatt.tech/simple/\n' > "$HOME/.config/pip/pip.conf" ;;
+            "uv with a named"*) printf '[project]\nname="p"\nversion="0"\nrequires-python=">=3.9"\ndependencies=["six==1.16.0"]\n\n[[tool.uv.index]]\nname="takumi-guard"\nurl="https://pypi.flatt.tech/simple/"\ndefault=true\n' > pyproject.toml ;;
+            "uv with an index named"*) printf '[project]\nname="p"\nversion="0"\nrequires-python=">=3.9"\ndependencies=["six==1.16.0"]\n\n[[tool.uv.index]]\nname="my-guard"\nurl="https://pypi.flatt.tech/simple/"\ndefault=true\n' > pyproject.toml ;;
+            "uv pip"*) echo "UV_INDEX_URL=https://pypi.flatt.tech/simple/" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-index-url: ${{ matrix.set-index-url }}
+
+      - name: The proxy rejects the token the client sent
+        working-directory: project
+        env:
+          CLIENT: ${{ matrix.client }}
+        run: |
+          case "$CLIENT" in
+            poetry*) POETRY_CACHE_DIR="$RUNNER_TEMP/pc" poetry lock -vvv > log.txt 2>&1 < /dev/null ;;
+            pip*) python -m pip install --no-cache-dir --target t six==1.16.0 > log.txt 2>&1 < /dev/null ;;
+            "uv pip"*) UV_NO_CACHE=1 uv pip install --target t six==1.16.0 > log.txt 2>&1 < /dev/null ;;
+            uv*) UV_NO_CACHE=1 uv lock > log.txt 2>&1 < /dev/null ;;
+          esac && { echo "::error::$CLIENT installed without the token"; tail -20 log.txt; exit 1; }
+          grep -q '401' log.txt || { echo "::error::$CLIENT failed for a reason other than the proxy rejecting the token"; tail -20 log.txt; exit 1; }
+          grep -m1 '401' log.txt
+
   transient-sts-error:
     name: a transient STS error is retried
     runs-on: ubuntu-latest
@@ -195,6 +615,7 @@ jobs:
           STS_URL: ${{ matrix.sts-url }}
           REGISTRY_URL: https://pypi.flatt.tech
           EXPIRES_IN: '1800'
+          UV_INDEX_NAME: takumi-guard
           EXPECTED: ${{ matrix.error }}
           EXPECTED_LOG: ${{ matrix.log }}
         run: |

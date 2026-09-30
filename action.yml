@@ -28,9 +28,13 @@ inputs:
     required: false
     default: '1800'
   set-index-url:
-    description: 'Set PIP_INDEX_URL and UV_INDEX_URL environment variables. Set to false if you manage the index URL yourself.'
+    description: 'Set PIP_INDEX_URL and UV_INDEX_URL environment variables. Set to false if you manage the index yourself.'
     required: false
     default: 'true'
+  uv-index-name:
+    description: 'The name of a uv index that points to the registry and is not declared in pyproject.toml or uv.toml in the checkout, such as one created after this action runs. The token is sent to the index with this name.'
+    required: false
+    default: 'takumi-guard'
 
 outputs:
   token-expires-at:
@@ -63,11 +67,28 @@ runs:
         AUDIENCE_INPUT: ${{ inputs.audience }}
         REGISTRY_URL: ${{ inputs.registry-url }}
         EXPIRES_IN: ${{ inputs.expires-in }}
+        SET_INDEX_URL: ${{ inputs.set-index-url }}
+        UV_INDEX_NAME: ${{ inputs.uv-index-name }}
       run: |
+        # The .netrc written below holds the token, so it is readable by the
+        # owner only.
+        umask 077
+
+        REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
+        # The host and port of the registry, which index URLs are compared with.
+        REGISTRY_AUTHORITY="${REGISTRY_HOST%%/*}"
+        # .netrc matches on the host name alone, without a port or path.
+        NETRC_HOST="${REGISTRY_AUTHORITY%%:*}"
+
         # Anonymous mode — no bot-id provided
         if [ -z "$BOT_ID" ]; then
           echo "::notice::No bot-id provided — running in anonymous mode (Tier A blocking)"
           exit 0
+        fi
+
+        if ! printf '%s' "$UV_INDEX_NAME" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+          echo "::error::uv-index-name must be the name of a uv index (letters, digits, '.', '_' and '-')."
+          exit 1
         fi
 
         # Get OIDC token
@@ -142,14 +163,165 @@ runs:
 
         echo "::add-mask::${ACCESS_TOKEN}"
 
-        # Set authenticated index URL with Basic auth embedded
-        # pip/uv use: https://token:ACCESS_TOKEN@host/simple/
-        REGISTRY_HOST=$(echo "$REGISTRY_URL" | sed 's|^https://||' | sed 's|/$||')
-        AUTHENTICATED_URL="https://token:${ACCESS_TOKEN}@${REGISTRY_HOST}/simple/"
+        # The host and port an index URL points to, and the URL without the
+        # credentials in it.
+        url_authority() { printf '%s' "$1" | sed -E 's|^[a-zA-Z+]+://||; s|^[^@/]*@||; s|/.*$||'; }
+        url_without_credentials() { printf '%s' "$1" | sed -E 's|^([a-zA-Z+]+://)[^@/]*@|\1|'; }
+        # uv reads the credentials for an index from UV_INDEX_<NAME>_USERNAME
+        # and _PASSWORD, where <NAME> is the index name in upper case with
+        # every other character than a letter or digit replaced by "_".
+        uv_index_variable() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g'; }
 
-        echo "::add-mask::${AUTHENTICATED_URL}"
-        echo "PIP_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
-        echo "UV_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
+        # The indexes this job may install from: the uv indexes and poetry
+        # sources in pyproject.toml and uv.toml in the checkout, the indexes
+        # requirements files set, and the extra indexes set in the job's
+        # environment. One per line: kind, name, URL, whether the index is
+        # explicit, and where it is set. A file that cannot be read is skipped.
+        INDEXES=$(mktemp)
+        trap 'rm -f "$STS_BODY" "$INDEXES"' EXIT
+        if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
+          { find "$GITHUB_WORKSPACE" -maxdepth 4 \( -name .git -o -name .venv -o -name node_modules \) -prune \
+                 -o \( -name pyproject.toml -o -name uv.toml -o -name 'requirements*.txt' \) -type f -print 2>/dev/null || true; } |
+          while IFS= read -r CFG; do
+            awk -v file="${CFG#"$GITHUB_WORKSPACE"/}" -v uvtoml="$([ "${CFG##*/}" = uv.toml ] && echo 1)" '
+              function flush() {
+                if (kind != "" && url != "") print kind "\t" (name == "" ? "-" : name) "\t" url "\t" (explicit ? 1 : 0) "\t" file ": " kind " index \047" (name == "" ? "-" : name) "\047"
+                kind = ""; name = ""; url = ""; explicit = 0
+              }
+              file ~ /(^|\/)requirements[^\/]*\.txt$/ {
+                if ($1 ~ /^(-i|--index-url|--extra-index-url)(=|$)/) {
+                  opt = $1; v = $2; if (opt ~ /=/) { v = opt; sub(/^[^=]*=/, "", v); sub(/=.*/, "", opt) }
+                  if (opt == "-i") opt = "--index-url"
+                  if (v != "") print "pip\t-\t" v "\t0\t" file ": " opt
+                }
+                next
+              }
+              /^[[:space:]]*\[/ {
+                flush(); h = $0; sub(/#.*/, "", h); gsub(/[[:space:]]/, "", h)
+                if (h == "[[tool.poetry.source]]") kind = "poetry"
+                else if (h == "[[tool.uv.index]]" || (uvtoml && h == "[[index]]")) kind = "uv"
+                next
+              }
+              kind != "" && /^[[:space:]]*(name|url|explicit|priority)[[:space:]]*=/ {
+                k = $0; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k)
+                v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]*(#.*)?$/, "", v); gsub(/^["\047]|["\047]$/, "", v)
+                if (k == "name") name = v
+                else if (k == "url") url = v
+                else if ((k == "explicit" && v == "true") || (k == "priority" && v == "explicit")) explicit = 1
+              }
+              END { flush() }' "$CFG" 2>/dev/null || true
+          done > "$INDEXES"
+        fi
+        for VAR in PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL; do
+          for URL in ${!VAR:-}; do
+            printf 'pip\t-\t%s\t0\t%s\n' "$URL" "$VAR" >> "$INDEXES"
+          done
+        done
+
+        # A uv index name that also names an index elsewhere never gets the
+        # token, because uv sends it to the index with that name wherever it
+        # points.
+        ELSEWHERE=" "
+        while IFS=$'\t' read -r KIND NAME URL EXPLICIT WHERE; do
+          if [ "$KIND" = uv ] && [ "$NAME" != - ] && [ "$(url_authority "$URL")" != "$REGISTRY_AUTHORITY" ]; then
+            ELSEWHERE="${ELSEWHERE}$(uv_index_variable "$NAME") "
+          fi
+        done < "$INDEXES"
+        export_uv_index() {
+          local var
+          var=$(uv_index_variable "$1")
+          case "$ELSEWHERE" in *" ${var} "*) return 1 ;; esac
+          echo "UV_INDEX_${var}_USERNAME=token" >> "$GITHUB_ENV"
+          echo "UV_INDEX_${var}_PASSWORD=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        }
+
+        # The uv index named in uv-index-name and every uv index in the
+        # checkout that points at the registry get the token under their own
+        # name. Any other index is reported, because installs from it do not go
+        # through Takumi Guard, except an explicit one, which serves only the
+        # packages the project assigns to it.
+        export_uv_index "$UV_INDEX_NAME" ||
+          echo "::warning::uv-index-name '${UV_INDEX_NAME}' names a uv index that does not point to Takumi Guard, so it does not get the token."
+        while IFS=$'\t' read -r KIND NAME URL EXPLICIT WHERE; do
+          if [ "$(url_authority "$URL")" = "$REGISTRY_AUTHORITY" ]; then
+            if [ "$KIND" = uv ] && [ "$NAME" != - ] && ! export_uv_index "$NAME"; then
+              echo "::warning::${WHERE} points to Takumi Guard, but another index with the same name points elsewhere, so it does not get the token."
+            fi
+          elif [ "$EXPLICIT" = 0 ]; then
+            echo "::warning::${WHERE} ($(url_without_credentials "$URL")) does not go through Takumi Guard."
+          fi
+        done < "$INDEXES"
+        rm -f "$INDEXES"
+
+        if [ "$SET_INDEX_URL" != "false" ]; then
+          # Set authenticated index URL with Basic auth embedded
+          # pip/uv use: https://token:ACCESS_TOKEN@host/simple/
+          AUTHENTICATED_URL="https://token:${ACCESS_TOKEN}@${REGISTRY_HOST}/simple/"
+          echo "::add-mask::${AUTHENTICATED_URL}"
+          echo "PIP_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
+          echo "UV_INDEX_URL=${AUTHENTICATED_URL}" >> "$GITHUB_ENV"
+        else
+          # The index is left as it is. An index variable that already points
+          # at the registry gets the token, replacing any credentials in it.
+          for VAR in PIP_INDEX_URL UV_INDEX_URL UV_DEFAULT_INDEX; do
+            VAL="${!VAR:-}"
+            if [ -n "$VAL" ] && [ "$(url_authority "$VAL")" = "$REGISTRY_AUTHORITY" ]; then
+              NEW="https://token:${ACCESS_TOKEN}@$(printf '%s' "$VAL" | sed -E 's|^[a-zA-Z+]+://||; s|^[^@/]*@||')"
+              echo "::add-mask::${NEW}"
+              echo "${VAR}=${NEW}" >> "$GITHUB_ENV"
+            fi
+          done
+        fi
+
+        # A .netrc for this job only, in RUNNER_TEMP, which the runner empties
+        # at the start and end of every job. It starts as a copy of the .netrc
+        # in use, so the entries for other hosts keep applying, and NETRC
+        # points to it for the rest of the job. pip and poetry send the token
+        # to the registry host whatever configuration points there.
+        # The .netrc in use: the file NETRC names, or else ~/.netrc, or else
+        # ~/_netrc, the order pip and poetry look for it.
+        if [ -n "${NETRC:-}" ]; then
+          NETRC_FILE="$NETRC"
+        elif [ -f "$HOME/.netrc" ]; then
+          NETRC_FILE="$HOME/.netrc"
+        else
+          NETRC_FILE="$HOME/_netrc"
+        fi
+        JOB_NETRC="${RUNNER_TEMP}/.netrc"
+        if [ "$NETRC_FILE" != "$JOB_NETRC" ] && [ -f "$NETRC_FILE" ]; then
+          cp "$NETRC_FILE" "$JOB_NETRC"
+        fi
+        NETRC_FILE="$JOB_NETRC"
+
+        # Removes the .netrc entry for the registry host, including one written
+        # on the same line as other entries, and keeps every other entry.
+        remove_netrc_entry() {
+          [ -f "$NETRC_FILE" ] || return 0
+          local tmp
+          tmp=$(mktemp "${NETRC_FILE}.XXXXXX")
+          if ! awk -v host="$NETRC_HOST" '
+            {
+              if ($0 !~ /(^|[[:space:]])(machine|default)([[:space:]]|$)/) { if (!skip) print; next }
+              out = ""
+              for (i = 1; i <= NF; i++) {
+                if ($i == "machine") skip = ($(i + 1) == host)
+                else if ($i == "default") skip = 0
+                if (!skip) out = out (out == "" ? "" : " ") $i
+              }
+              if (out != "") print out
+            }
+          ' "$NETRC_FILE" > "$tmp"; then
+            rm -f "$tmp"
+            echo "::error::Could not update ${NETRC_FILE}."
+            exit 1
+          fi
+          mv "$tmp" "$NETRC_FILE"
+        }
+
+        remove_netrc_entry
+        printf 'machine %s login token password %s\n' "$NETRC_HOST" "$ACCESS_TOKEN" >> "$NETRC_FILE"
+        chmod 600 "$NETRC_FILE"
+        echo "NETRC=${NETRC_FILE}" >> "$GITHUB_ENV"
 
         # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
         EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \

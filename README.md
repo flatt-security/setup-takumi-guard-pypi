@@ -130,7 +130,7 @@ steps:
 
 ### Auth-only (advanced)
 
-> **For custom setups.** You manage `PIP_INDEX_URL` / `UV_INDEX_URL` yourself. The action only handles authentication.
+> **For custom setups.** You point pip, uv or poetry at `https://pypi.flatt.tech/simple/` in your own configuration. The action leaves the index alone and only delivers the token.
 
 ```yaml
 - uses: flatt-security/setup-takumi-guard-pypi@v1
@@ -140,8 +140,17 @@ steps:
 ```
 
 **Key details:**
-- Useful for projects that need full control over pip/uv configuration.
-- Requires `PIP_INDEX_URL=https://pypi.flatt.tech/simple/` (and `UV_INDEX_URL` for uv) set in your environment or config files.
+- Useful for projects that keep their index configuration in `pip.conf`, `requirements.txt`, `pyproject.toml` or `uv.toml`.
+- Run the action after `actions/checkout`, so it can read the project's configuration.
+- pip and poetry take the token from the `.netrc` entry the action writes for `pypi.flatt.tech`. Nothing else to set up.
+- uv takes the token for:
+  - `UV_INDEX_URL`, `UV_DEFAULT_INDEX` or `PIP_INDEX_URL` that you set in the job's `env:` before the action and that point to `https://pypi.flatt.tech/simple/`. The action adds the token to them.
+  - Every named index (`[[tool.uv.index]]` in `pyproject.toml`, `[[index]]` in `uv.toml`) in the checkout that points to Takumi Guard, under its own name (uv 0.4.26 or later).
+  - An index the action cannot see, such as one created after it runs, when you pass its name in `uv-index-name` (`takumi-guard` by default).
+
+  uv sends these credentials to the index with that name wherever it points, so a name that any index in the checkout uses for another host gets no token, and the action reports it.
+
+  Other uv installs, such as an index without a name or `--index-url` on the command line, go through Takumi Guard without the token: malicious packages are still blocked, but the installs are not attributed to your bot.
 - If authentication fails, **the action exits with an error** -- there is no fallback.
 
 ---
@@ -150,7 +159,10 @@ steps:
 
 Unlike npm, pip does not use lockfiles that reference a specific registry URL by default. Most projects can adopt Takumi Guard without any lockfile changes.
 
-**For pip / uv:** No migration needed. The action sets `PIP_INDEX_URL` (for pip) and `UV_INDEX_URL` (for uv) so all installs automatically route through the proxy.
+**For pip / uv:** No migration needed. The action sets `PIP_INDEX_URL` (for pip) and `UV_INDEX_URL` (for uv) so all installs automatically route through the proxy. Two uv cases differ:
+
+- A uv project that sets its own default index in `pyproject.toml` or `uv.toml` keeps using it; the action does not override it. To route the project through Takumi Guard, point that index at `https://pypi.flatt.tech/simple/` and regenerate `uv.lock`. With `bot-id` set, the token then reaches that index on uv 0.8.3 or later; earlier versions install through Takumi Guard without it.
+- `uv pip install --index-url https://pypi.flatt.tech/simple/` on the command line installs without the token. Leave the index to the action instead.
 
 **For poetry** (with `poetry.lock`):
 
@@ -166,6 +178,8 @@ git add pyproject.toml poetry.lock
 git commit -m "Route installs through Takumi Guard"
 ```
 
+poetry does not read `PIP_INDEX_URL`; with `bot-id` set, it takes the token from the `.netrc` entry the action writes for `pypi.flatt.tech`, so its installs are attributed to your bot.
+
 ---
 
 ## Inputs
@@ -173,7 +187,8 @@ git commit -m "Route installs through Takumi Guard"
 | Input | Required | Default | Description |
 |---|---|---|---|
 | `bot-id` | No | -- | Bot ID from Shisho Cloud byGMO. Omit for blocking-only mode. |
-| `set-index-url` | No | `true` | Set `PIP_INDEX_URL` and `UV_INDEX_URL` environment variables. Set to `false` if you manage them yourself. |
+| `set-index-url` | No | `true` | Set `PIP_INDEX_URL` and `UV_INDEX_URL` environment variables. Set to `false` if you manage the index yourself (see [Auth-only](#auth-only-advanced)). |
+| `uv-index-name` | No | `takumi-guard` | The name of a uv index that points to Takumi Guard and is not in `pyproject.toml` or `uv.toml` in the checkout. The token is sent to the index with this name. |
 | `registry-url` | No | `https://pypi.flatt.tech` | Registry endpoint. |
 | `sts-url` | No | `https://sts.cloud.shisho.dev` | STS endpoint for token exchange. |
 | `expires-in` | No | `1800` | Token lifetime in seconds (max 86400). |
@@ -198,6 +213,8 @@ git commit -m "Route installs through Takumi Guard"
 | `invalid request` | Malformed bot-id | Double-check the bot-id value from your console |
 | `Authentication failed` | STS token exchange failed | Verify bot-id and trust settings |
 | `Could not reach the STS` | The runner could not connect to the STS | Check that the runner can reach the `sts-url` (default `https://sts.cloud.shisho.dev`), then re-run the job |
+| `... does not go through Takumi Guard` (warning) | A uv index, poetry source or `--index-url` / `--extra-index-url` in a requirements file in the checkout, or `PIP_EXTRA_INDEX_URL` / `UV_EXTRA_INDEX_URL` in the job, points to another index, so installs from it skip Takumi Guard | Point it to `https://pypi.flatt.tech/simple/`. An index marked `explicit` is not reported. `index-url` and `extra-index-url` under `[tool.uv]` are not checked |
+| `uv-index-name '...' names a uv index that does not point to Takumi Guard` (warning) | An index in the checkout with that name points to another host, so uv would send the token there | Give the Takumi Guard index a name no other index uses, and pass it in `uv-index-name` |
 | `STS returned non-JSON (HTTP N)` | The STS or a layer in front of it answered with something other than JSON, such as an HTML error page during an outage | Usually transient; re-run the job. The start of the response follows in the log as `sts body:` lines and shows what answered, which may be a proxy of your own |
 
 > **Still stuck?** Open an issue on this repository with your error output and workflow file (redact any IDs).
@@ -208,7 +225,9 @@ git commit -m "Route installs through Takumi Guard"
 
 - **Short-lived tokens** -- 30 minutes by default, 24 hours max.
 - **Auto-masked** -- Tokens and authenticated URLs are automatically masked in workflow logs.
-- **Environment-scoped** -- The action sets `PIP_INDEX_URL` and `UV_INDEX_URL` for the current job only. Your global pip/uv config is untouched.
+- **Environment variables for the job** -- `PIP_INDEX_URL`, `UV_INDEX_URL`, the uv index credentials and `NETRC` apply to the current job only. `pip.conf`, `uv.toml` and `~/.netrc` are not modified.
+- **Token in a job `.netrc`** -- With `bot-id` set, the token is written for the registry host to a `.netrc` in the runner's temporary directory, which the runner empties at the start and end of every job, and `NETRC` points to it for the rest of the job. The file starts as a copy of your existing one (the file `NETRC` names, else `~/.netrc`, else `~/_netrc`), so its entries for other hosts keep working.
+  - A later step in the same job that writes to `~/.netrc` has no effect; write to `$NETRC` instead. This applies to setup-takumi-guard-golang too: run it before this action, or Go downloads go through Takumi Guard without the token.
 - **Basic auth in URL** -- pip uses `https://token:ACCESS_TOKEN@host/simple/` format. The full URL is masked in logs.
 
 ---

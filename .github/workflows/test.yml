@@ -31,11 +31,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./
+        id: guard
 
       - name: The index is set without a token
+        env:
+          TOKEN: ${{ steps.guard.outputs.token }}
         run: |
           [ "$PIP_INDEX_URL" = "https://pypi.flatt.tech/simple/" ] || { echo "::error::PIP_INDEX_URL is '${PIP_INDEX_URL}'"; exit 1; }
           [ "$UV_INDEX_URL" = "https://pypi.flatt.tech/simple/" ] || { echo "::error::UV_INDEX_URL is '${UV_INDEX_URL}'"; exit 1; }
+          [ -z "$TOKEN" ] || { echo "::error::the token output was set without bot-id"; exit 1; }
 
   authenticated:
     name: authentication embeds the token in the index URL
@@ -117,6 +121,87 @@ jobs:
               [ "${!v:-}" = "https://token:standin-guard-token@pypi.flatt.tech/simple/" ] || { echo "::error::$v does not carry the token"; exit 1; }
             done
           fi
+
+  token-output:
+    name: the token output holds the token (set-index-url ${{ matrix.set-index-url }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        set-index-url: ['true', 'false']
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - uses: ./
+        id: guard
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+        with:
+          bot-id: standin-bot
+          sts-url: http://127.0.0.1:18080
+          set-index-url: ${{ matrix.set-index-url }}
+
+      - name: The output equals the token in the job .netrc
+        env:
+          TOKEN: ${{ steps.guard.outputs.token }}
+          EXPIRES_AT: ${{ steps.guard.outputs.token-expires-at }}
+        run: |
+          [ "$TOKEN" = standin-guard-token ] || { echo "::error::the token output does not hold the token"; exit 1; }
+          grep -qx "machine pypi.flatt.tech login token password ${TOKEN}" "$NETRC" || { echo "::error::the token output differs from the token in the job .netrc"; exit 1; }
+          [ -n "$EXPIRES_AT" ] || { echo "::error::token-expires-at was not set"; exit 1; }
+
+  # The runner prints the env: of the Set outputs step in the log before the
+  # step runs, so the auth step must mask the token by then. Set outputs masks
+  # it again, as the other setup-takumi-guard actions do.
+  token-output-mask:
+    name: both steps that handle the token mask it
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stand-in OIDC and STS endpoints
+        run: |
+          nohup python3 .github/test/standin.py >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.5; done
+
+      - name: Authenticate and Set outputs mask the token
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: http://127.0.0.1:18080/oidc
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: unused
+          BOT_ID: standin-bot
+          STS_URL: http://127.0.0.1:18080
+          REGISTRY_URL: https://pypi.flatt.tech
+          EXPIRES_IN: '1800'
+          SET_INDEX_URL: 'true'
+          UV_INDEX_NAME: takumi-guard
+        run: |
+          python3 - <<'EOF'
+          import yaml
+          for s in yaml.safe_load(open('action.yml'))['runs']['steps']:
+              out = {'Authenticate': 'authenticate.sh', 'Set outputs': 'set-outputs.sh'}.get(s.get('name'))
+              if out:
+                  open(out, 'w').write(s['run'])
+          EOF
+          : > "$RUNNER_TEMP/auth.out"; : > "$RUNNER_TEMP/set.out"
+          GITHUB_ENV="$RUNNER_TEMP/env" GITHUB_OUTPUT="$RUNNER_TEMP/auth.out" bash --noprofile --norc -e -o pipefail authenticate.sh > auth.log 2>&1 || { cat auth.log; exit 1; }
+          grep -qx 'token=standin-guard-token' "$RUNNER_TEMP/auth.out" || { echo "::error::Authenticate did not write the token output"; exit 1; }
+          awk '/^::add-mask::standin-guard-token$/ { m = 1 } END { exit !m }' auth.log || { echo "::error::Authenticate did not mask the token"; exit 1; }
+          ACCESS_TOKEN=standin-guard-token EXPIRES_AT=2026-01-01T00:00:00Z GITHUB_OUTPUT="$RUNNER_TEMP/set.out" bash --noprofile --norc -e -o pipefail set-outputs.sh > set.log 2>&1 || { cat set.log; exit 1; }
+          grep -qx '::add-mask::standin-guard-token' set.log || { echo "::error::Set outputs did not mask the token"; exit 1; }
+          grep -qx 'token=standin-guard-token' "$RUNNER_TEMP/set.out" || { echo "::error::Set outputs did not set the token output"; exit 1; }
+          : > "$RUNNER_TEMP/set.out"
+          ACCESS_TOKEN= EXPIRES_AT= GITHUB_OUTPUT="$RUNNER_TEMP/set.out" bash --noprofile --norc -e -o pipefail set-outputs.sh > set.log 2>&1 || { cat set.log; exit 1; }
+          [ ! -s "$RUNNER_TEMP/set.out" ] && [ ! -s set.log ] || { echo "::error::Set outputs wrote something without a token"; exit 1; }
 
   netrc-anonymous:
     name: without bot-id no .netrc is written
@@ -559,8 +644,10 @@ jobs:
         env:
           OUTCOME: ${{ steps.guard.outcome }}
           SET_INDEX_URL: ${{ matrix.set-index-url }}
+          TOKEN: ${{ steps.guard.outputs.token }}
         run: |
           [ "$OUTCOME" = "failure" ] || { echo "::error::the action ended with '${OUTCOME}' although authentication failed"; exit 1; }
+          [ -z "$TOKEN" ] || { echo "::error::the token output was set although authentication failed"; exit 1; }
           if [ "$SET_INDEX_URL" = "true" ]; then EXPECTED="https://pypi.flatt.tech/simple/"; else EXPECTED=""; fi
           [ "${PIP_INDEX_URL:-}" = "$EXPECTED" ] || { echo "::error::PIP_INDEX_URL is not '${EXPECTED}'"; exit 1; }
           [ "${UV_INDEX_URL:-}" = "$EXPECTED" ] || { echo "::error::UV_INDEX_URL is not '${EXPECTED}'"; exit 1; }

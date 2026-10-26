@@ -37,6 +37,9 @@ inputs:
     default: 'takumi-guard'
 
 outputs:
+  token:
+    description: 'The access token for the registry (empty in anonymous mode)'
+    value: ${{ steps.set-outputs.outputs.token }}
   token-expires-at:
     description: 'ISO 8601 timestamp when the token expires'
     value: ${{ steps.set-outputs.outputs.token-expires-at }}
@@ -323,6 +326,8 @@ runs:
         chmod 600 "$NETRC_FILE"
         echo "NETRC=${NETRC_FILE}" >> "$GITHUB_ENV"
 
+        echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
+
         # Calculate expiration timestamp (Linux date -d, macOS date -v fallback)
         EXPIRES_AT=$(date -u -d "+${EXPIRES_IN_ACTUAL} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
                      date -u -v+"${EXPIRES_IN_ACTUAL}"S +%Y-%m-%dT%H:%M:%SZ)
@@ -334,8 +339,13 @@ runs:
       id: set-outputs
       shell: bash
       env:
+        ACCESS_TOKEN: ${{ steps.auth.outputs.token }}
         EXPIRES_AT: ${{ steps.auth.outputs.expires_at }}
       run: |
+        if [ -n "$ACCESS_TOKEN" ]; then
+          echo "::add-mask::${ACCESS_TOKEN}"
+          echo "token=${ACCESS_TOKEN}" >> "$GITHUB_OUTPUT"
+        fi
         if [ -n "$EXPIRES_AT" ]; then
           echo "token-expires-at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
         fi

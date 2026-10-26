@@ -200,7 +200,48 @@ poetry does not read `PIP_INDEX_URL`; with `bot-id` set, it takes the token from
 
 | Output | Description |
 |---|---|
+| `token` | The access token for the registry. Only set when authenticated. |
 | `token-expires-at` | ISO 8601 timestamp of token expiration. Only set when authenticated. |
+
+The `token` output lets a step hand the token to a tool that does not see the job's environment variables or `$NETRC`, such as a Docker container. Pass it through `env:` and name the variable without its value, so the token does not appear on the command line:
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-pypi@v1
+  id: guard
+  with:
+    bot-id: 'BT01...'
+
+- name: Install in a container
+  env:
+    GUARD_TOKEN: ${{ steps.guard.outputs.token }}
+  run: |
+    docker run --rm -e GUARD_TOKEN \
+      -v "$PWD:/src" -w /src python:3.12 \
+      sh -c 'export PIP_INDEX_URL="https://token:$GUARD_TOKEN@pypi.flatt.tech/simple/" && pip install -r requirements.txt'
+```
+
+uv reads the same URL from `UV_INDEX_URL`. If you set `registry-url`, use its host in the URL.
+
+The token is a credential for your bot. Do not pass it with `docker build --build-arg` or write it into an image, because build arguments and image layers keep it after the job ends. For `docker build`, hand the job `.netrc` that `$NETRC` names to BuildKit as a secret instead; this needs no `token` output:
+
+```yaml
+- uses: flatt-security/setup-takumi-guard-pypi@v1
+  with:
+    bot-id: 'BT01...'
+
+- run: docker build --secret id=netrc,src="$NETRC" .
+```
+
+```dockerfile
+RUN --mount=type=secret,id=netrc,target=/root/.netrc \
+    pip install --index-url https://pypi.flatt.tech/simple/ -r requirements.txt
+```
+
+The secret is mounted for that one `RUN` and never becomes a layer, so the token stays out of the image and out of build args.
+
+The secret is mounted owned by root and readable by root only. If the `RUN` runs as another user, mount it in that user's home and give it that user's ID, for example `target=/home/app/.netrc,uid=1000`. Otherwise pip cannot read the file and installs without the token, with no error.
+
+`$NETRC` holds the entries of your existing `.netrc` as well (see [Security](#security)), so they are passed to the build too. To pass only the Takumi Guard entry, write a file with the `pypi.flatt.tech` line alone and use it as the secret.
 
 ---
 
